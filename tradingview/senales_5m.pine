@@ -1,0 +1,263 @@
+//@version=6
+// =============================================================================
+//  SEÑALES COMPRA / VENTA 5m  —  Confluencia de tendencia (sin repintado)
+// -----------------------------------------------------------------------------
+//  Diseñado para velas de 5 minutos (también sirve en 1m, 3m y 15m).
+//
+//  Una señal de COMPRA aparece solo cuando TODAS las condiciones habilitadas se
+//  cumplen al cierre de la vela. La señal de VENTA es la imagen espejo.
+//
+//   1. Tendencia 5m    : cierre sobre la EMA 200 (opcional: EMA 200 subiendo)
+//   2. Tendencia mayor : cierre de 15m sobre su EMA 50. Se usa la vela de 15m
+//                        YA CERRADA, por lo que este filtro no repinta.
+//   3. Disparador      : cruce EMA 9 sobre EMA 21  o  retroceso a la EMA 21 y
+//                        reanudación (cierre sobre EMA 9 y sobre el máximo previo)
+//   4. Fuerza          : ADX >= mínimo y +DI > -DI (evita mercado lateral)
+//   5. Momento         : RSI entre 50 y 70, histograma MACD positivo
+//   6. Volumen         : volumen >= promedio x multiplicador
+//   7. Vela            : vela alcista con cuerpo >= 0.3 ATR
+//   8. Extensión       : precio a menos de 1.5 ATR de la EMA 21 (no perseguir)
+//
+//  Además: máximo N señales por tramo de tendencia, velas mínimas entre señales,
+//  niveles SL/TP (por ATR o por mínimo/máximo reciente), alertas y panel de estado.
+// =============================================================================
+indicator("Señales Compra/Venta 5m (Confluencia)", shorttitle="Señales 5m", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ------------------------------- ENTRADAS ------------------------------------
+gT = "1) Tendencia"
+emaFastLen   = input.int(9,   "EMA rápida",    minval=1, group=gT)
+emaSlowLen   = input.int(21,  "EMA lenta",     minval=1, group=gT)
+emaTrendLen  = input.int(200, "EMA tendencia", minval=1, group=gT)
+useSlope     = input.bool(false, "Exigir pendiente de la EMA tendencia", group=gT, tooltip="Compra solo si la EMA 200 sube; venta solo si baja. Menos señales, más fiables.")
+slopeLen     = input.int(10, "Velas para medir la pendiente", minval=1, group=gT)
+useHTF       = input.bool(true, "Filtrar con temporalidad mayor", group=gT, tooltip="Usa la última vela CERRADA de la temporalidad mayor, por lo que no repinta.")
+htfTf        = input.timeframe("15", "Temporalidad mayor", group=gT)
+htfEmaLen    = input.int(50, "EMA de la temporalidad mayor", minval=1, group=gT)
+
+gS = "2) Disparador"
+trigMode     = input.string("Ambos", "Tipo de señal", options=["Cruce EMA 9/21", "Retroceso a EMA 21", "Ambos"], group=gS, tooltip="Cruce: la EMA 9 cruza la EMA 21. Retroceso: el precio toca la EMA 21 dentro de la tendencia y reanuda. Ambos: la primera que cumpla todos los filtros.")
+pbLook       = input.int(5, "Velas máximas desde el toque a la EMA 21", minval=1, maxval=20, group=gS)
+maxPerLeg    = input.int(1, "Máx. señales por tramo de tendencia", minval=1, maxval=10, group=gS, tooltip="Un tramo empieza en cada cruce de la EMA 9 con la EMA 21. Con 1 solo se marca la primera entrada válida de cada tramo.")
+cooldownBars = input.int(5, "Velas mínimas entre señales", minval=0, group=gS)
+onlyClose    = input.bool(true, "Confirmar al cierre de vela (sin repintado)", group=gS, tooltip="Si se desactiva, la señal puede aparecer y desaparecer mientras la vela está abierta.")
+
+gF = "3) Filtros"
+useADX       = input.bool(true, "ADX (fuerza de tendencia)", group=gF)
+adxLen       = input.int(14, "Longitud ADX", minval=1, group=gF)
+adxMin       = input.float(20, "ADX mínimo", minval=0, step=1, group=gF)
+useRSI       = input.bool(true, "RSI (momento)", group=gF)
+rsiLen       = input.int(14, "Longitud RSI", minval=1, group=gF)
+rsiBuyMax    = input.float(70, "RSI máximo para comprar", minval=50, maxval=100, group=gF)
+rsiSellMin   = input.float(30, "RSI mínimo para vender", minval=0, maxval=50, group=gF)
+useMACD      = input.bool(true, "MACD (histograma a favor)", group=gF)
+macdFast     = input.int(12, "MACD rápida", minval=1, group=gF)
+macdSlow     = input.int(26, "MACD lenta", minval=1, group=gF)
+macdSig      = input.int(9,  "MACD señal", minval=1, group=gF)
+useVol       = input.bool(true, "Volumen sobre promedio", group=gF)
+volLen       = input.int(20, "Promedio de volumen (velas)", minval=1, group=gF)
+volMult      = input.float(1.0, "Volumen mínimo (x promedio)", minval=0, step=0.1, group=gF)
+useCandle    = input.bool(true, "Vela de confirmación", group=gF)
+minBodyAtr   = input.float(0.3, "Cuerpo mínimo de la vela (x ATR)", minval=0, step=0.1, group=gF)
+useDist      = input.bool(true, "No perseguir el precio", group=gF)
+maxDistAtr   = input.float(1.5, "Distancia máx. a la EMA 21 (x ATR)", minval=0, step=0.1, group=gF)
+useVWAP      = input.bool(false, "VWAP (precio al lado correcto)", group=gF)
+useSession   = input.bool(false, "Operar solo en un horario", group=gF)
+sessStr      = input.session("0930-1600", "Horario (hora del exchange)", group=gF)
+
+gR = "4) Riesgo"
+showRisk     = input.bool(true, "Mostrar SL / TP en cada señal", group=gR)
+slMode       = input.string("ATR", "Stop loss", options=["ATR", "Mínimo/Máximo reciente"], group=gR)
+atrLen       = input.int(14, "Longitud ATR", minval=1, group=gR)
+slAtrMult    = input.float(1.5, "SL = ATR x", minval=0.1, step=0.1, group=gR)
+swingLen     = input.int(10, "Velas para el mínimo/máximo reciente", minval=2, group=gR)
+rr           = input.float(1.5, "Ratio beneficio/riesgo (TP = riesgo x)", minval=0.5, step=0.1, group=gR)
+riskBars     = input.int(12, "Largo de las líneas SL/TP (velas)", minval=1, maxval=200, group=gR)
+
+gV = "5) Visual"
+showEmas     = input.bool(true, "Mostrar EMAs", group=gV)
+showBg       = input.bool(true, "Sombrear el fondo según la tendencia", group=gV)
+showPanel    = input.bool(true, "Mostrar panel de estado", group=gV)
+colBuy       = input.color(#00c853, "Color compra", group=gV)
+colSell      = input.color(#ff1744, "Color venta", group=gV)
+
+// ------------------------------- TENDENCIA -----------------------------------
+emaFast  = ta.ema(close, emaFastLen)
+emaSlow  = ta.ema(close, emaSlowLen)
+emaTrend = ta.ema(close, emaTrendLen)
+atrVal   = ta.atr(atrLen)
+
+// Temporalidad mayor: se pide la vela YA CERRADA ([1] + lookahead_on) => no repinta
+htfClose = request.security(syminfo.tickerid, htfTf, close[1], lookahead=barmerge.lookahead_on)
+htfEma   = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead=barmerge.lookahead_on)
+htfValid = useHTF and timeframe.in_seconds(htfTf) > timeframe.in_seconds(timeframe.period)
+htfBull  = not htfValid or htfClose > htfEma
+htfBear  = not htfValid or htfClose < htfEma
+
+slopeUp   = not useSlope or emaTrend > emaTrend[slopeLen]
+slopeDown = not useSlope or emaTrend < emaTrend[slopeLen]
+
+bullBias = close > emaTrend and slopeUp and htfBull
+bearBias = close < emaTrend and slopeDown and htfBear
+
+// ------------------------------- DISPARADORES --------------------------------
+legUp         = emaFast > emaSlow
+crossBuy      = ta.crossover(emaFast, emaSlow)
+crossSell     = ta.crossunder(emaFast, emaSlow)
+barsCrossBuy  = nz(ta.barssince(crossBuy), -1)
+barsCrossSell = nz(ta.barssince(crossSell), -1)
+barsTouchLow  = nz(ta.barssince(low <= emaSlow), 99999)
+barsTouchHigh = nz(ta.barssince(high >= emaSlow), 99999)
+
+// Retroceso: el tramo ya lleva al menos pbLook velas, el precio tocó la EMA 21
+// hace menos de pbLook velas y ahora reanuda rompiendo el extremo de la vela anterior.
+pbBuy  = legUp and barsCrossBuy >= pbLook and barsTouchLow < pbLook and close > emaFast and close > high[1]
+pbSell = not legUp and barsCrossSell >= pbLook and barsTouchHigh < pbLook and close < emaFast and close < low[1]
+
+trigBuy = switch trigMode
+    "Cruce EMA 9/21"     => crossBuy
+    "Retroceso a EMA 21" => pbBuy
+    => crossBuy or pbBuy
+trigSell = switch trigMode
+    "Cruce EMA 9/21"     => crossSell
+    "Retroceso a EMA 21" => pbSell
+    => crossSell or pbSell
+
+// ------------------------------- FILTROS -------------------------------------
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+adxBuyOk  = not useADX or (adxVal >= adxMin and diPlus > diMinus)
+adxSellOk = not useADX or (adxVal >= adxMin and diMinus > diPlus)
+
+rsiVal    = ta.rsi(close, rsiLen)
+rsiBuyOk  = not useRSI or (rsiVal > 50 and rsiVal < rsiBuyMax)
+rsiSellOk = not useRSI or (rsiVal < 50 and rsiVal > rsiSellMin)
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+macdBuyOk  = not useMACD or macdHist > 0
+macdSellOk = not useMACD or macdHist < 0
+
+volAvg   = ta.sma(volume, volLen)
+volRatio = volAvg > 0 ? volume / volAvg : na
+volOk    = not useVol or na(volRatio) or volRatio >= volMult
+
+bodySize     = math.abs(close - open)
+candleBuyOk  = not useCandle or (close > open and bodySize >= atrVal * minBodyAtr)
+candleSellOk = not useCandle or (close < open and bodySize >= atrVal * minBodyAtr)
+
+distBuyOk  = not useDist or close - emaSlow <= atrVal * maxDistAtr
+distSellOk = not useDist or emaSlow - close <= atrVal * maxDistAtr
+
+vwapVal    = ta.vwap(hlc3)
+vwapBuyOk  = not useVWAP or close > vwapVal
+vwapSellOk = not useVWAP or close < vwapVal
+
+sessOk = not useSession or not na(time(timeframe.period, sessStr))
+
+// ------------------------------- SEÑALES -------------------------------------
+var int sigCountLeg = 0
+var int lastSigBar  = -100000
+var int lastDir     = 0
+
+// Cada cruce de la EMA 9 con la EMA 21 abre un tramo nuevo
+if legUp != legUp[1]
+    sigCountLeg := 0
+
+confirmed  = not onlyClose or barstate.isconfirmed
+cooldownOk = bar_index - lastSigBar >= cooldownBars
+legFree    = sigCountLeg < maxPerLeg
+
+buyRaw  = bullBias and trigBuy  and adxBuyOk  and rsiBuyOk  and macdBuyOk  and volOk and candleBuyOk  and distBuyOk  and vwapBuyOk  and sessOk
+sellRaw = bearBias and trigSell and adxSellOk and rsiSellOk and macdSellOk and volOk and candleSellOk and distSellOk and vwapSellOk and sessOk
+
+buySignal  = confirmed and buyRaw  and legUp     and cooldownOk and legFree
+sellSignal = confirmed and sellRaw and not legUp and cooldownOk and legFree
+
+if buySignal or sellSignal
+    sigCountLeg += 1
+    lastSigBar  := bar_index
+    lastDir     := buySignal ? 1 : -1
+
+// ------------------------------- RIESGO --------------------------------------
+swingLow  = ta.lowest(low, swingLen)
+swingHigh = ta.highest(high, swingLen)
+slBuy  = slMode == "ATR" ? close - atrVal * slAtrMult : swingLow  - atrVal * 0.1
+slSell = slMode == "ATR" ? close + atrVal * slAtrMult : swingHigh + atrVal * 0.1
+tpBuy  = close + (close - slBuy)  * rr
+tpSell = close - (slSell - close) * rr
+
+if showRisk and (buySignal or sellSignal)
+    float entryPx = close
+    float slPx    = buySignal ? slBuy : slSell
+    float tpPx    = buySignal ? tpBuy : tpSell
+    int   x2      = bar_index + riskBars
+    line.new(bar_index, entryPx, x2, entryPx, color=color.new(color.gray, 20), style=line.style_dotted)
+    line.new(bar_index, slPx, x2, slPx, color=colSell, style=line.style_dashed)
+    line.new(bar_index, tpPx, x2, tpPx, color=colBuy,  style=line.style_dashed)
+    label.new(x2, tpPx, "TP " + str.tostring(tpPx, format.mintick), style=label.style_label_left, color=color.new(colBuy, 10),  textcolor=color.white, size=size.tiny)
+    label.new(x2, slPx, "SL " + str.tostring(slPx, format.mintick), style=label.style_label_left, color=color.new(colSell, 10), textcolor=color.white, size=size.tiny)
+
+// ------------------------------- GRÁFICO -------------------------------------
+plot(showEmas ? emaFast  : na, "EMA rápida",    color=#26a69a, linewidth=1)
+plot(showEmas ? emaSlow  : na, "EMA lenta",     color=#ff9800, linewidth=1)
+plot(showEmas ? emaTrend : na, "EMA tendencia", color=#2962ff, linewidth=2)
+
+bgcolor(showBg ? (bullBias ? color.new(colBuy, 92) : bearBias ? color.new(colSell, 92) : na) : na, title="Fondo tendencia")
+
+plotshape(buySignal,  "COMPRA", style=shape.labelup,   location=location.belowbar, color=colBuy,  text="COMPRA", textcolor=color.white, size=size.small)
+plotshape(sellSignal, "VENTA",  style=shape.labeldown, location=location.abovebar, color=colSell, text="VENTA",  textcolor=color.white, size=size.small)
+
+// ------------------------------- ALERTAS -------------------------------------
+// Crear la alerta con "Una vez por cierre de vela" para que coincida con la señal.
+alertcondition(buySignal,  "Señal COMPRA", "COMPRA {{ticker}} {{interval}} @ {{close}}")
+alertcondition(sellSignal, "Señal VENTA",  "VENTA {{ticker}} {{interval}} @ {{close}}")
+alertcondition(buySignal or sellSignal, "Cualquier señal", "Señal en {{ticker}} {{interval}} @ {{close}}")
+
+if buySignal
+    alert("COMPRA " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(slBuy, format.mintick) + " | TP " + str.tostring(tpBuy, format.mintick), alert.freq_once_per_bar_close)
+if sellSignal
+    alert("VENTA " + syminfo.ticker + " " + timeframe.period + " @ " + str.tostring(close, format.mintick) + " | SL " + str.tostring(slSell, format.mintick) + " | TP " + str.tostring(tpSell, format.mintick), alert.freq_once_per_bar_close)
+
+// ------------------------------- PANEL ---------------------------------------
+var table panel = table.new(position.top_right, 2, 10, bgcolor=color.new(color.black, 20), frame_color=color.new(color.gray, 40), frame_width=1, border_color=color.new(color.gray, 70), border_width=1)
+
+f_row(int r, string k, string v, color c) =>
+    table.cell(panel, 0, r, k, text_color=color.new(color.white, 25), text_size=size.small, text_halign=text.align_left)
+    table.cell(panel, 1, r, v, text_color=c, text_size=size.small, text_halign=text.align_left)
+
+f_dirTxt(int d) => d == 1 ? "ALCISTA" : d == -1 ? "BAJISTA" : "NEUTRAL"
+f_dirCol(int d) => d == 1 ? colBuy : d == -1 ? colSell : color.gray
+f_tfName(string tf) => (str.contains(tf, "D") or str.contains(tf, "W") or str.contains(tf, "M") or str.contains(tf, "S")) ? tf : tf + "m"
+
+if showPanel and barstate.islast
+    int    biasDir  = bullBias ? 1 : bearBias ? -1 : 0
+    int    trendDir = close > emaTrend ? 1 : close < emaTrend ? -1 : 0
+    int    htfDir   = not htfValid ? 0 : htfClose > htfEma ? 1 : htfClose < htfEma ? -1 : 0
+    int    emaDir   = legUp ? 1 : -1
+    int    adxDir   = adxVal < adxMin ? 0 : diPlus > diMinus ? 1 : -1
+    int    rsiDir   = rsiVal > 50 ? 1 : rsiVal < 50 ? -1 : 0
+    int    macdDir  = macdHist > 0 ? 1 : macdHist < 0 ? -1 : 0
+    bool   volHigh  = not na(volRatio) and volRatio >= volMult
+    bool   is5m     = timeframe.period == "5"
+    string lastTxt  = lastDir == 0 ? "ninguna" : (lastDir == 1 ? "COMPRA" : "VENTA") + " hace " + str.tostring(bar_index - lastSigBar) + " velas"
+    table.cell(panel, 0, 0, "SEÑALES 5m", text_color=color.white, text_size=size.small, text_halign=text.align_left, bgcolor=color.new(color.gray, 60))
+    table.cell(panel, 1, 0, biasDir == 1 ? "SESGO ALCISTA" : biasDir == -1 ? "SESGO BAJISTA" : "SIN SESGO", text_color=f_dirCol(biasDir), text_size=size.small, text_halign=text.align_left, bgcolor=color.new(color.gray, 60))
+    f_row(1, "Tendencia EMA " + str.tostring(emaTrendLen), f_dirTxt(trendDir), f_dirCol(trendDir))
+    f_row(2, "Tendencia " + f_tfName(htfTf), htfValid ? f_dirTxt(htfDir) : "desactivada", f_dirCol(htfDir))
+    f_row(3, "EMA " + str.tostring(emaFastLen) + "/" + str.tostring(emaSlowLen), f_dirTxt(emaDir), f_dirCol(emaDir))
+    f_row(4, "ADX " + str.tostring(adxVal, "#.#"), adxDir == 0 ? "RANGO" : f_dirTxt(adxDir), f_dirCol(adxDir))
+    f_row(5, "RSI " + str.tostring(rsiVal, "#.#"), f_dirTxt(rsiDir), f_dirCol(rsiDir))
+    f_row(6, "MACD", f_dirTxt(macdDir), f_dirCol(macdDir))
+    f_row(7, "Volumen", na(volRatio) ? "n/d" : str.tostring(volRatio, "#.##") + "x promedio", volHigh ? colBuy : color.gray)
+    f_row(8, "Última señal", lastTxt, lastDir == 1 ? colBuy : lastDir == -1 ? colSell : color.gray)
+    f_row(9, "Temporalidad", is5m ? "5m" : f_tfName(timeframe.period) + " (diseñado para 5m)", is5m ? colBuy : color.orange)
+
+// ------------------------------- BACKTEST (opcional) -------------------------
+// Para medir la precisión en el "Probador de estrategias":
+//  1. Cambia la línea indicator(...) por:
+//     strategy("Señales 5m", overlay=true, default_qty_type=strategy.percent_of_equity, default_qty_value=10, commission_type=strategy.commission.percent, commission_value=0.05)
+//  2. Descomenta estas líneas al final del script:
+// if buySignal
+//     strategy.entry("Compra", strategy.long)
+//     strategy.exit("Salida compra", "Compra", stop=slBuy, limit=tpBuy)
+// if sellSignal
+//     strategy.entry("Venta", strategy.short)
+//     strategy.exit("Salida venta", "Venta", stop=slSell, limit=tpSell)
